@@ -2,6 +2,8 @@
 // or more contributor license agreements. Licensed under the Elastic License;
 // you may not use this file except in compliance with the Elastic License.
 
+//go:build integration && aws
+
 package awss3
 
 import (
@@ -15,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/elastic/beats/v7/libbeat/statestore"
 	"github.com/elastic/beats/v7/libbeat/statestore/storetest"
@@ -207,36 +211,45 @@ file_selectors:
 	return inputConfig
 }
 
+func makeBenchmarkConfigSQS(queueURL, region string, maxMessagesInflight int) *conf.C {
+	return conf.MustNewConfigFrom(fmt.Sprintf(`---
+queue_url: %s
+default_region: %s,
+max_number_of_messages: %d
+visibility_timeout: 30s
+file_selectors:
+-
+  regex: '.json.gz$'
+  expand_event_list_from_field: Records
+`, queueURL, region, maxMessagesInflight))
+}
 func benchmarkInputSQS(t *testing.T, maxMessagesInflight int) testing.BenchmarkResult {
 	return testing.Benchmark(func(b *testing.B) {
-		log := logp.NewLogger(inputName)
-		metricRegistry := monitoring.NewRegistry()
-		metrics := newInputMetrics("test_id", metricRegistry, maxMessagesInflight)
-		sqsAPI := newConstantSQS()
-		s3API := newConstantS3(t)
-		pipeline := &fakePipeline{}
-		conf := makeBenchmarkConfig(t)
+		// Terraform is used to set up S3 and SQS and must be executed manually.
+		tfConfig := getTerraformOutputs(t)
 
-		s3EventHandlerFactory := newS3ObjectProcessorFactory(log.Named("s3"), metrics, s3API, conf.FileSelectors, backupConfig{}, maxMessagesInflight)
-		sqsMessageHandler := newSQSS3EventProcessor(log.Named("sqs_s3_event"), metrics, sqsAPI, nil, time.Minute, 5, pipeline, s3EventHandlerFactory, maxMessagesInflight)
-		sqsReader := newSQSReader(log.Named("sqs"), metrics, sqsAPI, maxMessagesInflight, sqsMessageHandler)
+		// Ensure SQS is empty before testing.
+		drainSQS(t, tfConfig.AWSRegion, tfConfig.QueueURL)
 
-		ctx, cancel := context.WithCancel(context.Background())
-		b.Cleanup(cancel)
+		uploadS3TestFileMultipleTimes(t, tfConfig.AWSRegion, tfConfig.BucketName, "testdata/aws-cloudtrail.json.gz", 100)
 
-		go func() {
-			for metrics.sqsMessagesReceivedTotal.Get() < uint64(b.N) {
-				time.Sleep(5 * time.Millisecond)
-			}
+		s3Input := createInput(t, makeBenchmarkConfigSQS(tfConfig.QueueURL, tfConfig.AWSRegion, maxMessagesInflight))
+
+		inputCtx, cancel := newV2Context(maxMessagesInflight)
+		t.Cleanup(cancel)
+		time.AfterFunc(15*time.Second, func() {
 			cancel()
-		}()
+		})
 
 		b.ResetTimer()
 		start := time.Now()
-		if err := sqsReader.Receive(ctx); err != nil {
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatal(err)
-			}
+		var errGroup errgroup.Group
+		errGroup.Go(func() error {
+			return s3Input.Run(inputCtx, &fakePipeline{})
+		})
+
+		if err := errGroup.Wait(); err != nil {
+			t.Fatal(err)
 		}
 		b.StopTimer()
 		elapsed := time.Since(start)
@@ -244,14 +257,16 @@ func benchmarkInputSQS(t *testing.T, maxMessagesInflight int) testing.BenchmarkR
 		b.ReportMetric(float64(maxMessagesInflight), "max_messages_inflight")
 		b.ReportMetric(elapsed.Seconds(), "sec")
 
-		b.ReportMetric(float64(metrics.s3EventsCreatedTotal.Get()), "events")
-		b.ReportMetric(float64(metrics.s3EventsCreatedTotal.Get())/elapsed.Seconds(), "events_per_sec")
+		b.ReportMetric(float64(s3Input.metrics.s3EventsCreatedTotal.Get()), "events")
+		b.ReportMetric(float64(s3Input.metrics.s3EventsCreatedTotal.Get())/elapsed.Seconds(), "events_per_sec")
 
-		b.ReportMetric(float64(metrics.s3BytesProcessedTotal.Get()), "s3_bytes")
-		b.ReportMetric(float64(metrics.s3BytesProcessedTotal.Get())/elapsed.Seconds(), "s3_bytes_per_sec")
+		b.ReportMetric(float64(s3Input.metrics.s3BytesProcessedTotal.Get()), "s3_bytes")
+		b.ReportMetric(float64(s3Input.metrics.s3BytesProcessedTotal.Get())/elapsed.Seconds(), "s3_bytes_per_sec")
 
-		b.ReportMetric(float64(metrics.sqsMessagesDeletedTotal.Get()), "sqs_messages")
-		b.ReportMetric(float64(metrics.sqsMessagesDeletedTotal.Get())/elapsed.Seconds(), "sqs_messages_per_sec")
+		b.ReportMetric(float64(s3Input.metrics.sqsMessagesDeletedTotal.Get()), "sqs_messages")
+		b.ReportMetric(float64(s3Input.metrics.sqsMessagesDeletedTotal.Get())/elapsed.Seconds(), "sqs_messages_per_sec")
+
+		s3Input.metrics.Close()
 	})
 }
 
