@@ -211,27 +211,31 @@ file_selectors:
 	return inputConfig
 }
 
+//default_region: %s,
+//endpoint: %s.amazonaws.com
+
 func makeBenchmarkConfigSQS(queueURL, region string, maxMessagesInflight int) *conf.C {
 	return conf.MustNewConfigFrom(fmt.Sprintf(`---
 queue_url: %s
-default_region: %s,
+region: %s
 max_number_of_messages: %d
 visibility_timeout: 30s
 file_selectors:
 -
-  regex: '.json.gz$'
+  regex: 'aws-cloudtrail'
   expand_event_list_from_field: Records
 `, queueURL, region, maxMessagesInflight))
 }
 func benchmarkInputSQS(t *testing.T, maxMessagesInflight int) testing.BenchmarkResult {
 	return testing.Benchmark(func(b *testing.B) {
+		logp.TestingSetup()
 		// Terraform is used to set up S3 and SQS and must be executed manually.
 		tfConfig := getTerraformOutputs(t)
 
 		// Ensure SQS is empty before testing.
 		drainSQS(t, tfConfig.AWSRegion, tfConfig.QueueURL)
 
-		uploadS3TestFileMultipleTimes(t, tfConfig.AWSRegion, tfConfig.BucketName, "testdata/aws-cloudtrail.json.gz", 100)
+		uploadS3TestFileMultipleTimes(t, tfConfig.AWSRegion, tfConfig.BucketName, cloudtrailTestFile, 100)
 
 		s3Input := createInput(t, makeBenchmarkConfigSQS(tfConfig.QueueURL, tfConfig.AWSRegion, maxMessagesInflight))
 

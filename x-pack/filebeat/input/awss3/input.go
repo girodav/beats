@@ -131,7 +131,7 @@ func (in *s3Input) Run(inputContext v2.Context, pipeline beat.Pipeline) error {
 		if err != nil {
 			return fmt.Errorf("failed to initialize sqs receiver: %w", err)
 		}
-		// defer receiver.metrics.Close()
+		defer receiver.metrics.Close()
 
 		// Poll metrics periodically in the background
 		go pollSqsWaitingMetric(ctx, receiver)
