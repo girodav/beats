@@ -15,7 +15,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
+
+	"runtime"
+
 	"strings"
 	"testing"
 	"time"
@@ -163,11 +167,11 @@ func createInput(t *testing.T, cfg *common.Config) *s3Input {
 	return inputV2.(*s3Input)
 }
 
-func newV2Context() (v2.Context, func()) {
+func newV2Context(maxMessagesInflight int) (v2.Context, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	return v2.Context{
 		Logger:      logp.NewLogger(inputName).With("id", inputID),
-		ID:          inputID,
+		ID:          fmt.Sprintf("%s-%d", inputID, maxMessagesInflight),
 		Cancelation: ctx,
 	}, cancel
 }
@@ -197,7 +201,7 @@ func TestInputRunSQS(t *testing.T) {
 
 	s3Input := createInput(t, makeTestConfigSQS(tfConfig.QueueURL))
 
-	inputCtx, cancel := newV2Context()
+	inputCtx, cancel := newV2Context(0)
 	t.Cleanup(cancel)
 	time.AfterFunc(15*time.Second, func() {
 		cancel()
@@ -260,7 +264,7 @@ func TestInputRunS3(t *testing.T) {
 
 	s3Input := createInput(t, makeTestConfigS3(tfConfig.BucketName))
 
-	inputCtx, cancel := newV2Context()
+	inputCtx, cancel := newV2Context(0)
 	t.Cleanup(cancel)
 	time.AfterFunc(15*time.Second, func() {
 		cancel()
@@ -332,6 +336,47 @@ func uploadS3TestFiles(t *testing.T, region, bucket string, filenames ...string)
 		result, err := uploader.Upload(&s3manager.UploadInput{
 			Bucket:      aws.String(bucket),
 			Key:         aws.String(filepath.Base(filename)),
+			Body:        bytes.NewReader(data),
+			ContentType: aws.String(contentType),
+		})
+		if err != nil {
+			t.Fatalf("Failed to upload file %q: %v", filename, err)
+		}
+		t.Logf("File uploaded to %s", result.Location)
+	}
+}
+
+func uploadS3TestFileMultipleTimes(t *testing.T, region, bucket, filename string, n int) {
+	t.Helper()
+
+	cfg, err := external.LoadDefaultAWSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Region = region
+	uploader := s3manager.NewUploader(cfg)
+
+	_, basefile, _, _ := runtime.Caller(0)
+	basedir := path.Dir(basefile)
+	data, err := ioutil.ReadFile(path.Join(basedir, filename))
+	if err != nil {
+		t.Fatalf("Failed to open file %q, %v", filename, err)
+	}
+
+	contentType := ""
+	if strings.HasSuffix(filename, "ndjson") || strings.HasSuffix(filename, "ndjson.gz") {
+		contentType = contentTypeNDJSON + "; charset=UTF-8"
+	} else if strings.HasSuffix(filename, "json") || strings.HasSuffix(filename, "json.gz") {
+		contentType = contentTypeJSON + "; charset=UTF-8"
+	}
+
+	// Upload the file to S3.
+	for i := 0; i < n; i++ {
+		filenameBase := filepath.Base(filename)
+		filenameExt := filepath.Ext(filenameBase)
+		result, err := uploader.Upload(&s3manager.UploadInput{
+			Bucket:      aws.String(bucket),
+			Key:         aws.String(fmt.Sprintf("%s-%d.%s", filenameBase, i, filenameExt)),
 			Body:        bytes.NewReader(data),
 			ContentType: aws.String(contentType),
 		})
@@ -469,7 +514,7 @@ func TestInputRunSNS(t *testing.T) {
 
 	s3Input := createInput(t, makeTestConfigSQS(tfConfig.QueueURLForSNS))
 
-	inputCtx, cancel := newV2Context()
+	inputCtx, cancel := newV2Context(0)
 	t.Cleanup(cancel)
 	time.AfterFunc(15*time.Second, func() {
 		cancel()
